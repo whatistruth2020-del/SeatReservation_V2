@@ -1,0 +1,73 @@
+{
+  "dashboard": {
+    "title": "Seat Reservation",
+    "tags": ["seat-reservation"],
+    "timezone": "browser",
+    "panels": [
+      {
+        "title": "Reservations Confirmed (Total)",
+        "type": "stat",
+        "targets": [{ "expr": "reservation_confirmed_total", "legendFormat": "Confirmed" }],
+        "gridPos": {"x": 0, "y": 0, "w": 6, "h": 4}
+      },
+      {
+        "title": "Declined: Seat Taken",
+        "type": "stat",
+        "targets": [{ "expr": "reservation_declined_seat_taken_total", "legendFormat": "Seat Taken" }],
+        "gridPos": {"x": 6, "y": 0, "w": 6, "h": 4}
+      },
+      {
+        "title": "Declined: User Limit",
+        "type": "stat",
+        "targets": [{ "expr": "reservation_declined_user_limit_total", "legendFormat": "User Limit" }],
+        "gridPos": {"x": 12, "y": 0, "w": 6, "h": 4}
+      },
+      {
+        "title": "Declined: Idempotent Replay",
+        "type": "stat",
+        "targets": [{ "expr": "reservation_declined_idempotent_replay_total", "legendFormat": "Replays" }],
+        "gridPos": {"x": 18, "y": 0, "w": 6, "h": 4}
+      },
+      {
+        "title": "Server Errors (Should Be 0)",
+        "type": "stat",
+        "targets": [{ "expr": "reservation_errors_server_total", "legendFormat": "5xx" }],
+        "gridPos": {"x": 0, "y": 4, "w": 6, "h": 4}
+      },
+      {
+        "title": "Seats Available (Gauge)",
+        "type": "gauge",
+        "targets": [{ "expr": "seats_available", "legendFormat": "Available" }],
+        "gridPos": {"x": 6, "y": 4, "w": 6, "h": 4}
+      },
+      {
+        "title": "Reservation Latency (p50/p95/p99)",
+        "type": "graph",
+        "targets": [
+          { "expr": "histogram_quantile(0.50, sum(rate(reservation_latency_seconds_bucket[1m])) by (le))", "legendFormat": "p50" },
+          { "expr": "histogram_quantile(0.95, sum(rate(reservation_latency_seconds_bucket[1m])) by (le))", "legendFormat": "p95" },
+          { "expr": "histogram_quantile(0.99, sum(rate(reservation_latency_seconds_bucket[1m])) by (le))", "legendFormat": "p99" }
+        ],
+        "gridPos": {"x": 12, "y": 4, "w": 12, "h": 8}
+      },
+      {
+        "title": "Lock Acquire Latency",
+        "type": "graph",
+        "targets": [
+          { "expr": "histogram_quantile(0.99, sum(rate(reservation_lock_acquire_latency_seconds_bucket[1m])) by (le))", "legendFormat": "p99" }
+        ],
+        "gridPos": {"x": 0, "y": 12, "w": 12, "h": 8}
+      },
+      {
+        "title": "DB Transaction Latency",
+        "type": "graph",
+        "targets": [
+          { "expr": "histogram_quantile(0.99, sum(rate(reservation_db_transaction_latency_seconds_bucket[1m])) by (le))", "legendFormat": "p99" }
+        ],
+        "gridPos": {"x": 12, "y": 12, "w": 12, "h": 8}
+      }
+    ],
+    "time": { "from": "now-15m", "to": "now" },
+    "refresh": "10s"
+  }
+}
