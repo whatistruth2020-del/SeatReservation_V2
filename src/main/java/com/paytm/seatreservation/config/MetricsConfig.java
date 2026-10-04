@@ -14,26 +14,36 @@ public class MetricsConfig {
 
     @Bean
     public JvmMemoryMetrics jvmMemoryMetrics(MeterRegistry registry) {
-        return new JvmMemoryMetrics(registry);
+        JvmMemoryMetrics metrics = new JvmMemoryMetrics();
+        metrics.bindTo(registry);
+        return metrics;
     }
 
     @Bean
     public JvmGcMetrics jvmGcMetrics(MeterRegistry registry) {
-        return new JvmGcMetrics(registry);
+        JvmGcMetrics metrics = new JvmGcMetrics();
+        metrics.bindTo(registry);
+        return metrics;
     }
 
     @Bean
     public JvmThreadMetrics jvmThreadMetrics(MeterRegistry registry) {
-        return new JvmThreadMetrics(registry);
+        JvmThreadMetrics metrics = new JvmThreadMetrics();
+        metrics.bindTo(registry);
+        return metrics;
     }
 
     @Bean
     public ProcessorMetrics processorMetrics(MeterRegistry registry) {
-        return new ProcessorMetrics(registry);
+        ProcessorMetrics metrics = new ProcessorMetrics();
+        metrics.bindTo(registry);
+        return metrics;
     }
 
     @Bean
     public FileDescriptorMetrics fileDescriptorMetrics(MeterRegistry registry) {
-        return new FileDescriptorMetrics(registry);
+        FileDescriptorMetrics metrics = new FileDescriptorMetrics();
+        metrics.bindTo(registry);
+        return metrics;
     }
 }

@@ -3,10 +3,7 @@ package com.paytm.seatreservation.controller;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.actuate.health.Health;
-import org.springframework.boot.actuate.health.HealthIndicator;
 import org.springframework.boot.actuate.health.Status;
-import org.springframework.dao.DataAccessResourceFailureException;
-import org.springframework.data.redis.RedisConnectionFailureException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RestController;
@@ -36,7 +33,7 @@ public class HealthController {
         try {
             jdbcTemplate.queryForObject("SELECT 1", Integer.class);
             builder.withDetail("database", "UP");
-        } catch (DataAccessResourceFailureException | Exception e) {
+        } catch (Exception e) {
             builder.withDetail("database", "DOWN: " + e.getMessage());
             return builder.status(Status.DOWN).build();
         }
@@ -49,7 +46,7 @@ public class HealthController {
             } else {
                 builder.withDetail("redis", "NOT_CONFIGURED");
             }
-        } catch (RedisConnectionFailureException | Exception e) {
+        } catch (Exception e) {
             builder.withDetail("redis", "DOWN: " + e.getMessage());
             return builder.status(Status.DOWN).build();
         }
