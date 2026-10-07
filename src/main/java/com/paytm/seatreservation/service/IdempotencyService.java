@@ -5,62 +5,93 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.paytm.seatreservation.dto.ReserveResponse;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
-
+import lombok.RequiredArgsConstructor;
 import java.time.Duration;
 import java.util.Optional;
-
 @Service
+@RequiredArgsConstructor
 public class IdempotencyService {
 
     private final RedisTemplate<String, Object> redisTemplate;
-    private final ObjectMapper objectMapper;
-    private final String keyPrefix = "idempotency:";
 
-    public IdempotencyService(RedisTemplate<String, Object> redisTemplate, ObjectMapper objectMapper) {
-        this.redisTemplate = redisTemplate;
-        this.objectMapper = objectMapper;
+    private static final String CACHE_PREFIX = "idempotency:";
+    private static final String PENDING_PREFIX = "idempotency:pending:";
+
+    private String buildCacheKey(String operation, String idempotencyKey) {
+        return CACHE_PREFIX + operation + ":" + idempotencyKey;
     }
 
-    /**
-     * Checks if idempotency key exists and returns cached response if found.
-     * Returns Optional.empty() if not found.
-     */
-    public Optional<ReserveResponse> getCachedResponse(String idempotencyKey) {
-        try {
-            String key = keyPrefix + idempotencyKey;
-            Object cached = redisTemplate.opsForValue().get(key);
-            if (cached != null) {
-                return Optional.of(objectMapper.convertValue(cached, ReserveResponse.class));
-            }
-        } catch (Exception e) {
-            // Log error but don't fail - fall through to DB check
+    private String buildPendingKey(String operation, String idempotencyKey) {
+        return PENDING_PREFIX + operation + ":" + idempotencyKey;
+    }
+
+    // ---------------------------------------------------------
+    // CACHE RESPONSE
+    // ---------------------------------------------------------
+
+    public <T> void cacheResponse(
+            String operation,
+            String idempotencyKey,
+            T response,
+            Duration ttl) {
+
+        String key = buildCacheKey(operation, idempotencyKey);
+
+        redisTemplate.opsForValue().set(
+                key,
+                response,
+                ttl);
+    }
+
+    // ---------------------------------------------------------
+    // GET CACHED RESPONSE
+    // ---------------------------------------------------------
+
+    public <T> Optional<T> getCachedResponse(
+            String operation,
+            String idempotencyKey,
+            Class<T> responseType) {
+
+        String key = buildCacheKey(operation, idempotencyKey);
+
+        Object value = redisTemplate.opsForValue().get(key);
+
+        if (value == null) {
+            return Optional.empty();
         }
-        return Optional.empty();
+
+        return Optional.of(responseType.cast(value));
     }
 
-    /**
-     * Stores the response in Redis cache
-     */
-    public void cacheResponse(String idempotencyKey, ReserveResponse response, Duration ttl) {
-        try {
-            String key = keyPrefix + idempotencyKey;
-            redisTemplate.opsForValue().set(key, response, ttl);
-        } catch (Exception e) {
-            // Log error but don't fail
-        }
+    // ---------------------------------------------------------
+    // MARK REQUEST AS PENDING
+    // ---------------------------------------------------------
+
+    public boolean tryMarkPending(
+            String operation,
+            String idempotencyKey,
+            Duration ttl) {
+
+        String key = buildPendingKey(operation, idempotencyKey);
+
+        Boolean created = redisTemplate.opsForValue()
+                .setIfAbsent(key, "PROCESSING", ttl);
+
+        return Boolean.TRUE.equals(created);
     }
 
-    /**
-     * Stores a pending marker to prevent concurrent processing of same key
-     * Returns true if marker was set (first request), false if already exists
-     */
-    public boolean tryMarkPending(String idempotencyKey, Duration ttl) {
-        String key = keyPrefix + idempotencyKey + ":pending";
-        return Boolean.TRUE.equals(redisTemplate.opsForValue().setIfAbsent(key, "1", ttl));
-    }
+    // ---------------------------------------------------------
+    // REMOVE PENDING
+    // ---------------------------------------------------------
 
-    public void removePending(String idempotencyKey) {
-        String key = keyPrefix + idempotencyKey + ":pending";
+    public void removePending(
+            String operation,
+            String idempotencyKey) {
+
+        String key = buildPendingKey(operation, idempotencyKey);
+
         redisTemplate.delete(key);
     }
+    
+    
 }

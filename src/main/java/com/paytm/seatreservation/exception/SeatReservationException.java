@@ -1,5 +1,7 @@
 package com.paytm.seatreservation.exception;
 
+import java.util.UUID;
+
 public class SeatReservationException extends RuntimeException {
 
     private final String errorCode;
@@ -62,4 +64,37 @@ public class SeatReservationException extends RuntimeException {
     public static SeatReservationException internalError(String message) {
         return new SeatReservationException("INTERNAL_ERROR", message, 500);
     }
+
+	public static SeatReservationException reservationNotFound(UUID reservationId) {
+		// TODO Auto-generated method stub
+		return new SeatReservationException("HOLD_EXPIRED", "Hold on seat " + reservationId + " has expired", 409);
+		
+	}
+
+	public static SeatReservationException reservationNotHeld(UUID reservationId) {
+		// TODO Auto-generated method stub
+		return new SeatReservationException("HOLD_EXPIRED", "Hold on seat " + reservationId + " has expired", 409);
+	}
+
+	public static SeatReservationException reservationAlreadyConfirmed(UUID reservationId) {
+		// TODO Auto-generated method stub
+		return new SeatReservationException("HOLD_EXPIRED", "Hold on seat " + reservationId + " is already confirmed", 409);
+	}
+
+	public static SeatReservationException reservationExpired(UUID reservationId) {
+		// TODO Auto-generated method stub
+			return new SeatReservationException("HOLD_EXPIRED", "Hold on seat " + reservationId + " has expired", 409);
+	}
+
+	public static SeatReservationException invalidReservationState(UUID reservationId,String s) {
+		// TODO Auto-generated method stub
+		return new SeatReservationException("HOLD_EXPIRED", "Hold on seat " + reservationId + " has expired", 409);
+	}
+
+	public static SeatReservationException invalidReservationState(String string) {
+		// TODO Auto-generated method stub
+		return new SeatReservationException("HOLD_EXPIRED", "Hold on seat " + string + " has expired", 409);
+	}
+
+	
 }

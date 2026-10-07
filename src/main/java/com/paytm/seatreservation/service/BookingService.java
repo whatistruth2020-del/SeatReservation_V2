@@ -2,9 +2,11 @@ package com.paytm.seatreservation.service;
 
 import com.paytm.seatreservation.config.AppProperties;
 import com.paytm.seatreservation.config.ReservationMetrics;
+import com.paytm.seatreservation.dto.ConfirmResponse;
 import com.paytm.seatreservation.dto.ReserveRequest;
 import com.paytm.seatreservation.dto.ReserveResponse;
 import com.paytm.seatreservation.entity.Reservation;
+import com.paytm.seatreservation.entity.ReservationSeat;
 import com.paytm.seatreservation.entity.ReservationStatus;
 import com.paytm.seatreservation.entity.Seat;
 import com.paytm.seatreservation.entity.SeatStatus;
@@ -12,6 +14,7 @@ import com.paytm.seatreservation.entity.Show;
 import com.paytm.seatreservation.entity.UserBookingLimit;
 import com.paytm.seatreservation.exception.SeatReservationException;
 import com.paytm.seatreservation.repository.ReservationRepository;
+import com.paytm.seatreservation.repository.ReservationSeatRepository;
 import com.paytm.seatreservation.repository.SeatRepository;
 import com.paytm.seatreservation.repository.ShowRepository;
 import com.paytm.seatreservation.repository.UserBookingLimitRepository;
@@ -39,6 +42,7 @@ public class BookingService {
     private final ShowRepository showRepository;
     private final SeatRepository seatRepository;
     private final ReservationRepository reservationRepository;
+    private final ReservationSeatRepository reservationSeatRepository;
     private final UserBookingLimitRepository userBookingLimitRepository;
     private final RedisLockService redisLockService;
     private final IdempotencyService idempotencyService;
@@ -52,96 +56,229 @@ public class BookingService {
             maxAttempts = 3,
             backoff = @Backoff(delay = 10, multiplier = 2)
     )
-    public ReserveResponse reserveSeats(Long showId, Long userId, ReserveRequest request, String idempotencyKey) {
-        Timer.Sample reservationTimer = metrics.startReservationTimer();
-        Timer.Sample lockTimer = metrics.startLockAcquireTimer();
-        Timer.Sample dbTimer = metrics.startDbTransactionTimer();
+    public ReserveResponse reserveSeats(
+            Long showId,
+            Long userId,
+            ReserveRequest request,
+            String idempotencyKey) {
+
+        Timer.Sample reservationTimer =
+                metrics.startReservationTimer();
+
+        Timer.Sample lockTimer =
+                metrics.startLockAcquireTimer();
+
+        Timer.Sample dbTimer =
+                metrics.startDbTransactionTimer();
 
         try {
-            // 1. Check idempotency cache first
-            Optional<ReserveResponse> cached = idempotencyService.getCachedResponse(idempotencyKey);
+
+            // =====================================================
+            // 1. CHECK COMPLETED RESPONSE FIRST
+            // =====================================================
+
+            Optional<ReserveResponse> cached =
+                    idempotencyService.getCachedResponse(
+                            "reserve",
+                            idempotencyKey,
+                            ReserveResponse.class);
+
             if (cached.isPresent()) {
+
                 metrics.incrementDeclinedIdempotentReplay();
+
                 metrics.stopReservationTimer(reservationTimer);
-                log.info("Idempotent replay for key: {}", idempotencyKey);
+
+                log.info(
+                        "Idempotent replay for reserve key: {}",
+                        idempotencyKey);
+
                 return cached.get();
             }
 
-            // 2. Try to mark as pending in Redis (prevents concurrent processing of same key)
-            if (!idempotencyService.tryMarkPending(idempotencyKey, appProperties.getIdempotencyTtl())) {
-                // Another request with same key is being processed, wait and check cache
-                Optional<ReserveResponse> pendingCached = waitForPending(idempotencyKey);
+
+            // =====================================================
+            // 2. MARK REQUEST AS PENDING
+            // =====================================================
+
+            if (!idempotencyService.tryMarkPending(
+                    "reserve",
+                    idempotencyKey,
+                    appProperties.getIdempotencyTtl())) {
+
+                // Another request with the same key is processing
+
+                Optional<ReserveResponse> pendingCached =
+                		waitForPending(
+                                "reserve",
+                                idempotencyKey,
+                                ReserveResponse.class
+                        );
+
                 if (pendingCached.isPresent()) {
+
                     metrics.incrementDeclinedIdempotentReplay();
+
                     metrics.stopReservationTimer(reservationTimer);
+
                     return pendingCached.get();
                 }
-                // If we get here, the pending request failed, we can proceed
             }
+
+
+            RedisLockService.AcquiredLocks lockResult = null;
 
             try {
-                // 3. Validate show exists
-                Show show = showRepository.findById(showId)
-                        .orElseThrow(() -> SeatReservationException.showNotFound(showId));
 
-                // 4. Validate seat count
-                if (request.getSeats().size() > appProperties.getMaxSeatsPerRequest()) {
-                    throw SeatReservationException.tooManySeats(appProperties.getMaxSeatsPerRequest());
+                // =================================================
+                // 3. VALIDATE SHOW
+                // =================================================
+
+                Show show = showRepository.findById(showId)
+                        .orElseThrow(() ->
+                                SeatReservationException
+                                        .showNotFound(showId));
+
+
+                // =================================================
+                // 4. VALIDATE SEAT COUNT
+                // =================================================
+
+                if (request.getSeats().size()
+                        > appProperties.getMaxSeatsPerRequest()) {
+
+                    throw SeatReservationException.tooManySeats(
+                            appProperties.getMaxSeatsPerRequest());
                 }
 
-                // 5. Check user limit (with pessimistic lock)
-                UserBookingLimit userLimit = checkAndIncrementUserLimit(showId, userId, request.getSeats().size(), show.getPerUserLimit());
 
-                // 6. Acquire Redis locks for seats (sorted to prevent deadlock)
-                List<String> acquiredLocks = redisLockService.acquireLocks(
-                        showId, request.getSeats(), appProperties.getHoldTtl());
+                // =================================================
+                // 5. CHECK USER BOOKING LIMIT
+                // =================================================
+
+                UserBookingLimit userLimit =
+                        checkAndIncrementUserLimit(
+                                showId,
+                                userId,
+                                request.getSeats().size(),
+                                show.getPerUserLimit());
+
+
+                // =================================================
+                // 6. ACQUIRE REDIS SEAT LOCKS
+                // =================================================
+
+                lockResult = redisLockService.acquireLocks(
+                        showId,
+                        request.getSeats(),
+                        appProperties.getHoldTtl());
+
                 metrics.stopLockAcquireTimer(lockTimer);
 
-                if (acquiredLocks.isEmpty()) {
-                    // Failed to acquire locks - seat(s) taken
-                    rollbackUserLimit(userLimit, request.getSeats().size());
+                if (lockResult == null) {
+
+                    rollbackUserLimit(
+                            userLimit,
+                            request.getSeats().size());
+
                     metrics.incrementDeclinedSeatTaken();
-                    metrics.stopReservationTimer(reservationTimer);
-                    throw SeatReservationException.seatTaken("one or more requested seats");
+
+                    throw SeatReservationException.seatTaken(
+                            "one or more requested seats");
                 }
 
-                try {
-                    // 7. Execute atomic DB transaction with optimistic locking
-                    ReserveResponse response = executeReservationTransaction(
-                            show, userId, request, idempotencyKey, acquiredLocks, userLimit);
-                    metrics.stopDbTransactionTimer(dbTimer);
 
-                    // 8. Cache successful response
-                    idempotencyService.cacheResponse(idempotencyKey, response, appProperties.getIdempotencyTtl());
-                    idempotencyService.removePending(idempotencyKey);
+                // =================================================
+                // 7. DATABASE TRANSACTION
+                // =================================================
 
-                    // 9. Update metrics
-                    metrics.incrementConfirmed();
-                    updateSeatsAvailableMetric(showId);
+                ReserveResponse response =
+                        executeReservationTransaction(
+                                show,
+                                userId,
+                                request,
+                                idempotencyKey,
+                                lockResult.getKeys(),
+                                userLimit);
 
-                    metrics.stopReservationTimer(reservationTimer);
-                    return response;
+                metrics.stopDbTransactionTimer(dbTimer);
 
-                } catch (SeatReservationException e) {
-                    // Release Redis locks on failure
-                    redisLockService.releaseLocks(acquiredLocks, getLockValue(acquiredLocks));
-                    rollbackUserLimit(userLimit, request.getSeats().size());
-                    throw e;
-                }
+
+                // =================================================
+                // 8. CACHE SUCCESSFUL RESPONSE
+                // =================================================
+
+                idempotencyService.cacheResponse(
+                        "reserve",
+                        idempotencyKey,
+                        response,
+                        appProperties.getIdempotencyTtl());
+
+
+                // =================================================
+                // 9. REMOVE PENDING
+                // =================================================
+
+                idempotencyService.removePending(
+                        "reserve",
+                        idempotencyKey);
+
+
+                metrics.incrementConfirmed();
+
+                updateSeatsAvailableMetric(showId);
+
+                metrics.stopReservationTimer(reservationTimer);
+
+                return response;
+
 
             } catch (SeatReservationException e) {
-                idempotencyService.removePending(idempotencyKey);
+
+                // DB failed / business failure
+
+                idempotencyService.removePending(
+                        "reserve",
+                        idempotencyKey);
+
+              //  rollbackUserLimitIfNecessary(e);
+
                 throw e;
+
+            } finally {
+
+                // =================================================
+                // 10. ALWAYS RELEASE REDIS SEAT LOCK
+                // =================================================
+
+                if (lockResult != null) {
+
+                    redisLockService.releaseLocks(
+                            lockResult.getKeys(),
+                            lockResult.getLockValue());
+                }
             }
 
+
         } catch (SeatReservationException e) {
+
             metrics.stopReservationTimer(reservationTimer);
+
             throw e;
+
+
         } catch (Exception e) {
+
             metrics.incrementServerError();
+
             metrics.stopReservationTimer(reservationTimer);
-            log.error("Unexpected error during reservation", e);
-            throw SeatReservationException.internalError("Reservation failed: " + e.getMessage());
+
+            log.error(
+                    "Unexpected error during reservation",
+                    e);
+
+            throw SeatReservationException.internalError(
+                    "Reservation failed: " + e.getMessage());
         }
     }
 
@@ -213,57 +350,49 @@ public class BookingService {
             }
         }
 
-        // Create reservation record
-        UUID reservationId = UUID.randomUUID();
+     // Create reservation record in HELD state
+       // UUID reservationId = UUID.randomUUID();
         Long amountPaise = show.getPricePaise() * request.getSeats().size();
 
         Reservation reservation = Reservation.builder()
                 .idempotencyKey(idempotencyKey)
                 .showId(show.getId())
                 .userId(userId)
-                .seatNumbers(request.getSeats().toArray(new String[0]))
                 .amountPaise(amountPaise)
-                .status(ReservationStatus.CONFIRMED)
-                .reservationId(reservationId)
-                .confirmedAt(now)
+                .status(ReservationStatus.HELD)
+                .expiresAt(holdExpiresAt)
                 .build();
 
-        reservationRepository.save(reservation);
+        for (Seat seat : seats) {
 
-        // Update user limit: move from held to confirmed
-        userLimit.setTicketsHeld(userLimit.getTicketsHeld() - request.getSeats().size());
-        userLimit.setTicketsConfirmed(userLimit.getTicketsConfirmed() + request.getSeats().size());
+            ReservationSeat reservationSeat = ReservationSeat.builder()
+                    .reservation(reservation)
+                    .seat(seat)
+                    .build();
+
+            reservation.getReservationSeats().add(reservationSeat);
+        }
+        Reservation savedReservation = reservationRepository.save(reservation);
+        //reservationRepository.save(reservation);
+        
+        // Keep the tickets in HELD state.
+        // They will move to CONFIRMED only when /confirm is called.
         userBookingLimitRepository.save(userLimit);
 
-        log.info("Reservation confirmed: id={}, user={}, seats={}", reservationId, userId, request.getSeats());
+        log.info("Reservation held: id={}, user={}, seats={}, expiresAt={}",
+        		savedReservation.getReservationId(), request.getSeats(), holdExpiresAt);
 
         return ReserveResponse.builder()
-                .reservationId(reservationId)
+                .reservationId(savedReservation.getReservationId())
                 .showId(show.getId())
                 .userId(userId)
                 .seats(request.getSeats())
                 .amountPaise(amountPaise)
-                .status("confirmed")
+                .status("HELD")
                 .build();
     }
 
-    private Optional<ReserveResponse> waitForPending(String idempotencyKey) {
-        // Simple polling - in production could use Redis pub/sub
-        for (int i = 0; i < 10; i++) {
-            try {
-                Thread.sleep(100);
-                Optional<ReserveResponse> cached = idempotencyService.getCachedResponse(idempotencyKey);
-                if (cached.isPresent()) {
-                    return cached;
-                }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
-            }
-        }
-        return Optional.empty();
-    }
-
+    
     private String getLockValue(List<String> acquiredLocks) {
         // In a real implementation, we'd store the lock value
         // For now, we'll just release without value check (less safe)
@@ -279,5 +408,317 @@ public class BookingService {
     public void expireHolds() {
         // This is better handled by a scheduled job that finds all expired holds
         // Implementation would use a custom query to find expired seats
+    }
+
+    @Transactional(isolation = Isolation.READ_COMMITTED)
+    public ConfirmResponse confirmReservation(
+            UUID reservationId,
+            Long userId,
+            String idempotencyKey) {
+
+        Timer.Sample reservationTimer =
+                metrics.startReservationTimer();
+
+        try {
+
+            // =====================================================
+            // 1. CHECK CONFIRM IDEMPOTENCY CACHE
+            // =====================================================
+
+            Optional<ConfirmResponse> cached =
+                    idempotencyService.getCachedResponse(
+                            "confirm",
+                            idempotencyKey,
+                            ConfirmResponse.class);
+
+            if (cached.isPresent()) {
+
+                metrics.incrementDeclinedIdempotentReplay();
+
+                log.info(
+                        "Idempotent replay for confirm key: {}",
+                        idempotencyKey);
+
+                return cached.get();
+            }
+
+
+            // =====================================================
+            // 2. MARK CONFIRM REQUEST AS PENDING
+            // =====================================================
+
+            if (!idempotencyService.tryMarkPending(
+                    "confirm",
+                    idempotencyKey,
+                    appProperties.getIdempotencyTtl())) {
+
+                Optional<ConfirmResponse> pendingCached =
+                		 waitForPending(
+                	                "confirm",
+                	                idempotencyKey,
+                	                ConfirmResponse.class
+                	        );
+
+                if (pendingCached.isPresent()) {
+
+                    metrics.incrementDeclinedIdempotentReplay();
+
+                    return pendingCached.get();
+                }
+                
+                // The previous request may still be processing.
+                throw SeatReservationException.internalError(
+                        "Confirm request is already being processed"
+                );
+            }
+
+
+            RedisLockService.AcquiredLocks lockResult = null;
+
+            try {
+
+                // =================================================
+                // 3. LOAD RESERVATION WITH DB LOCK
+                // =================================================
+
+                Reservation reservation =
+                        reservationRepository
+                                .findByIdForUpdate(reservationId)
+                                .orElseThrow(() ->
+                                        SeatReservationException
+                                                .reservationNotFound(
+                                                        reservationId));
+
+
+                // =================================================
+                // 4. VERIFY USER
+                // =================================================
+
+                if (!reservation.getUserId().equals(userId)) {
+
+                    throw SeatReservationException
+                            .reservationNotFound(reservationId);
+                }
+
+
+                // =================================================
+                // 5. VERIFY RESERVATION STATE
+                // =================================================
+
+                if (reservation.getStatus()
+                        != ReservationStatus.HELD) {
+
+                    throw SeatReservationException
+                            .invalidReservationState(
+                                    "Reservation is not HELD");
+                }
+
+
+                // =================================================
+                // 6. VERIFY EXPIRY
+                // =================================================
+
+                OffsetDateTime now =
+                        OffsetDateTime.now();
+
+                if (reservation.getExpiresAt() == null
+                        || !reservation.getExpiresAt()
+                                .isAfter(now)) {
+
+                    throw SeatReservationException
+                            .reservationExpired(
+                                    reservationId);
+                }
+
+
+                // =================================================
+                // 7. GET SEATS FROM RESERVATION
+                // =================================================
+
+                List<String> seatNumbers =
+                        reservation.getReservationSeats()
+                                .stream()
+                                .map(rs ->
+                                        rs.getSeat()
+                                          .getSeatNumber())
+                                .sorted()
+                                .toList();
+
+
+                // =================================================
+                // 8. ACQUIRE REDIS SEAT LOCKS
+                // =================================================
+
+                lockResult =
+                        redisLockService.acquireLocks(
+                                reservation.getShowId(),
+                                seatNumbers,
+                                appProperties.getHoldTtl());
+
+                if (lockResult == null) {
+
+                    throw SeatReservationException.seatTaken(
+                            "one or more seats are locked");
+                }
+
+
+                // =================================================
+                // 9. CONFIRM SEATS IN DATABASE
+                // =================================================
+
+                for (ReservationSeat reservationSeat :
+                        reservation.getReservationSeats()) {
+
+                    Seat seat =
+                            reservationSeat.getSeat();
+
+                    if (seat.getStatus()
+                            != SeatStatus.HELD) {
+
+                        throw SeatReservationException.seatTaken(
+                                seat.getSeatNumber());
+                    }
+
+                    if (!userId.equals(
+                            seat.getUserId())) {
+
+                        throw SeatReservationException.seatTaken(
+                                seat.getSeatNumber());
+                    }
+
+                    int updated =
+                            seatRepository.confirmSeat(
+                                    seat.getId(),
+                                    seat.getVersion(),
+                                    SeatStatus.HELD,
+                                    SeatStatus.CONFIRMED);
+
+                    if (updated != 1) {
+
+                        throw SeatReservationException.seatTaken(
+                                seat.getSeatNumber());
+                    }
+                }
+
+
+                // =================================================
+                // 10. CONFIRM RESERVATION
+                // =================================================
+
+                reservation.setStatus(
+                        ReservationStatus.CONFIRMED);
+
+                reservation.setConfirmedAt(now);
+
+                reservationRepository.save(reservation);
+
+
+                // =================================================
+                // 11. UPDATE BOOKING COUNTERS
+                // =================================================
+
+                int seatCount =
+                        reservation.getReservationSeats()
+                                .size();
+
+                // Your existing counter-update logic here.
+
+
+                // =================================================
+                // 12. BUILD RESPONSE
+                // =================================================
+
+                ConfirmResponse response =
+
+                        ConfirmResponse.builder()
+                                .reservationId(reservationId)
+                                .showId(reservation.getShowId())
+                                .userId(reservation.getUserId())
+                                .amountPaise(reservation.getAmountPaise())
+                                .status("CONFIRMED")
+                                .build();
+
+
+                // =================================================
+                // 13. CACHE CONFIRM RESPONSE
+                // =================================================
+
+                idempotencyService.cacheResponse(
+                        "confirm",
+                        idempotencyKey,
+                        response,
+                        appProperties.getIdempotencyTtl());
+
+
+                // =================================================
+                // 14. REMOVE CONFIRM PENDING
+                // =================================================
+
+                idempotencyService.removePending(
+                        "confirm",
+                        idempotencyKey);
+
+
+                return response;
+
+
+            } catch (SeatReservationException e) {
+
+                idempotencyService.removePending(
+                        "confirm",
+                        idempotencyKey);
+
+                throw e;
+
+            } finally {
+
+                // =================================================
+                // 15. RELEASE REDIS SEAT LOCK
+                // =================================================
+
+                if (lockResult != null) {
+
+                    redisLockService.releaseLocks(
+                            lockResult.getKeys(),
+                            lockResult.getLockValue());
+                }
+            }
+
+
+        } finally {
+
+            metrics.stopReservationTimer(reservationTimer);
+        }
+    }
+    
+    
+    
+    private <T> Optional<T> waitForPending(
+            String operation,
+            String idempotencyKey,
+            Class<T> responseType) {
+
+        for (int i = 0; i < 10; i++) {
+
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return Optional.empty();
+            }
+
+            Optional<T> cached =
+                    idempotencyService.getCachedResponse(
+                            operation,
+                            idempotencyKey,
+                            responseType
+                    );
+
+            if (cached.isPresent()) {
+                return cached;
+            }
+        }
+
+        return Optional.empty();
     }
 }

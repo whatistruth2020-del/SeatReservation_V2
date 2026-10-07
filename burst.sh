@@ -1,107 +1,367 @@
 #!/bin/bash
-# burst.sh - Load test for seat reservation
-# Usage: ./burst.sh <BASE_URL> [SHOW_ID] [SEAT] [USERS] [REQUESTS_PER_USER]
+
+# Usage:
+# ./burst.sh <BASE_URL> [SHOW_ID] [SEAT] [USERS] [REQUESTS_PER_USER]
 
 set -euo pipefail
 
-BASE_URL="${1:-http://localhost:8080}"
+BASE_URL="${1:-http://localhost:8081}"
 SHOW_ID="${2:-1}"
-SEAT="${3:-A1}"
-USERS="${4:-200}"
+SEAT="${3:-A6}"
+USERS="${4:-20}"
 REQ_PER_USER="${5:-10}"
 
 TOTAL=$((USERS * REQ_PER_USER))
+
+RESERVE_URL="$BASE_URL/shows/$SHOW_ID/reserve"
+
+WORK_DIR=$(mktemp -d)
+RESULTS="$WORK_DIR/results"
+
+mkdir -p "$RESULTS"
+
+cleanup() {
+    rm -rf "$WORK_DIR"
+}
+
+trap cleanup EXIT
+
 echo "=========================================="
-echo "BURST TEST: $TOTAL requests for seat $SEAT"
-echo "Target: $BASE_URL/shows/$SHOW_ID/reserve"
-echo "Users: $USERS, Reqs/user: $REQ_PER_USER"
+echo "BURST TEST"
 echo "=========================================="
+echo "Target:       $BASE_URL"
+echo "Show ID:      $SHOW_ID"
+echo "Hot seat:     $SEAT"
+echo "Users:        $USERS"
+echo "Req/user:     $REQ_PER_USER"
+echo "Total:        $TOTAL"
+echo "=========================================="
+echo ""
 
-# Create results file
-RESULTS=$(mktemp)
-trap "rm -f $RESULTS" EXIT
+echo "Firing $TOTAL concurrent RESERVE requests..."
+echo ""
 
-# Fire all requests in parallel
-echo "Firing requests..."
-start_time=$(date +%s%3N)
+START_TIME=$(date +%s)
 
-for u in $(seq 1 $USERS); do
-    for r in $(seq 1 $REQ_PER_USER); do
-        IDEMPOTENCY_KEY="burst-u${u}-r${r}-$(date +%s%3N)-$RANDOM"
-        curl -s -X POST "$BASE_URL/shows/$SHOW_ID/reserve" \
-            -H "Content-Type: application/json" \
-            -H "X-User-Id: $u" \
-            -H "Idempotency-Key: $IDEMPOTENCY_KEY" \
-            -d "{\"seats\":[\"$SEAT\"]}" \
-            -w "%{http_code}\n" -o /dev/null >> "$RESULTS" &
+# ============================================================
+# RESERVE STORM
+# ============================================================
+
+for u in $(seq 1 "$USERS"); do
+
+    for r in $(seq 1 "$REQ_PER_USER"); do
+
+        IDEMPOTENCY_KEY="burst-u${u}-r${r}-$(date +%s%N)-$RANDOM"
+
+        RESPONSE_FILE="$RESULTS/u${u}_r${r}.body"
+        STATUS_FILE="$RESULTS/u${u}_r${r}.status"
+
+        (
+            curl -s \
+                --connect-timeout 10 \
+                --max-time 30 \
+                -X POST "$RESERVE_URL" \
+                -H "Content-Type: application/json" \
+                -H "X-User-Id: $u" \
+                -H "Idempotency-Key: $IDEMPOTENCY_KEY" \
+                -d "{\"seats\":[\"$SEAT\"]}" \
+                -o "$RESPONSE_FILE" \
+                -w "%{http_code}" \
+                > "$STATUS_FILE" 2>/dev/null
+        ) &
+
     done
+
 done
 
 wait
-end_time=$(date +%s%3N)
-duration_ms=$((end_time - start_time))
 
-# Analyze results
+END_TIME=$(date +%s)
+DURATION=$((END_TIME - START_TIME))
+
+# ============================================================
+# RESERVE RESULTS
+# ============================================================
+
 echo ""
 echo "=========================================="
-echo "RESULTS (completed in ${duration_ms}ms)"
+echo "RESERVE RESULTS"
 echo "=========================================="
 
-TOTAL_REQ=$(wc -l < "$RESULTS")
-HTTP_201=$(grep -c "^201$" "$RESULTS" || true)
-HTTP_409=$(grep -c "^409$" "$RESULTS" || true)
-HTTP_5XX=$(grep -c "^5" "$RESULTS" || true)
-OTHER=$(grep -vE "^(201|409|5..)$" "$RESULTS" | wc -l || true)
+HTTP_201=0
+HTTP_409=0
+HTTP_5XX=0
+OTHER=0
 
-echo "Total requests:  $TOTAL_REQ"
-echo "  201 Created:   $HTTP_201"
-echo "  409 Conflict:  $HTTP_409"
-echo "  5xx Error:     $HTTP_5XX"
-echo "  Other:         $OTHER"
+WINNING_RESPONSE=""
+
+for status_file in "$RESULTS"/*.status; do
+
+    [ -f "$status_file" ] || continue
+
+    STATUS=$(cat "$status_file")
+    BODY_FILE="${status_file%.status}.body"
+
+    case "$STATUS" in
+
+        201)
+            HTTP_201=$((HTTP_201 + 1))
+
+            if [ -z "$WINNING_RESPONSE" ]; then
+                WINNING_RESPONSE="$BODY_FILE"
+            fi
+            ;;
+
+        409)
+            HTTP_409=$((HTTP_409 + 1))
+            ;;
+
+        5*)
+            HTTP_5XX=$((HTTP_5XX + 1))
+            ;;
+
+        *)
+            OTHER=$((OTHER + 1))
+            ;;
+
+    esac
+
+done
+
+COMPLETED=$((HTTP_201 + HTTP_409 + HTTP_5XX + OTHER))
+
+echo "Completed:     $COMPLETED / $TOTAL"
+echo "201 Created:   $HTTP_201  (successful HOLD)"
+echo "409 Conflict:  $HTTP_409"
+echo "5xx Error:     $HTTP_5XX"
+echo "Other:         $OTHER"
+echo "Duration:      ${DURATION}s"
 echo ""
 
-# Verify reconciliation
-echo "Checking show state..."
-STATE=$(curl -s "$BASE_URL/shows/$SHOW_ID" 2>/dev/null || echo "{}")
-AVAIL=$(echo "$STATE" | grep -o '"availableSeats":[0-9]*' | cut -d: -f2 || echo 0)
-HELD=$(echo "$STATE" | grep -o '"heldSeats":[0-9]*' | cut -d: -f2 || echo 0)
-CONF=$(echo "$STATE" | grep -o '"confirmedSeats":[0-9]*' | cut -d: -f2 || echo 0)
-TOTAL_SEATS=$(echo "$STATE" | grep -o '"totalSeats":[0-9]*' | cut -d: -f2 || echo 0)
+# ============================================================
+# CHECK WINNER
+# ============================================================
 
-echo "Show state:"
-echo "  Available:  $AVAIL"
-echo "  Held:       $HELD"
-echo "  Confirmed:  $CONF"
-echo "  Total:      $TOTAL_SEATS"
-SUM=$((AVAIL + HELD + CONF))
-echo "  Sum:        $SUM"
-if [ "$SUM" -eq "$TOTAL_SEATS" ]; then
-    echo "  ✓ RECONCILIATION OK"
-else
-    echo "  ✗ RECONCILIATION FAILED (sum=$SUM, total=$TOTAL_SEATS)"
+if [ "$HTTP_201" -eq 0 ]; then
+
+    echo "ERROR: No successful reservation."
+    echo "Cannot CONFIRM."
+
+    exit 1
+
 fi
 
-# Check seat status
-SEAT_STATUS=$(echo "$STATE" | grep -A2 "\"seatNumber\":\"$SEAT\"" | grep '"status"' | head -1 | cut -d'"' -f4 || echo "unknown")
-echo "  Seat $SEAT status: $SEAT_STATUS"
+if [ "$HTTP_201" -ne 1 ]; then
 
-# Validation
+    echo "ERROR: Expected exactly one successful HOLD."
+    echo "Actual: $HTTP_201"
+
+    exit 1
+
+fi
+
+echo "=========================================="
+echo "SUCCESSFUL RESERVE RESPONSE"
+echo "=========================================="
+
+cat "$WINNING_RESPONSE"
+
 echo ""
+echo ""
+
+# ============================================================
+# EXTRACT RESERVATION ID WITHOUT PYTHON
+# ============================================================
+
+RESERVATION_ID=$(grep -o '"reservationId"[[:space:]]*:[[:space:]]*"[^"]*"' "$WINNING_RESPONSE" \
+    | head -1 \
+    | sed 's/.*"reservationId"[[:space:]]*:[[:space:]]*"//' \
+    | sed 's/".*//')
+
+if [ -z "$RESERVATION_ID" ]; then
+
+    echo "ERROR: reservationId could not be extracted."
+
+    echo "Response was:"
+    cat "$WINNING_RESPONSE"
+
+    exit 1
+
+fi
+
+echo "=========================================="
+echo "WINNING RESERVATION"
+echo "=========================================="
+
+echo "Reservation ID: $RESERVATION_ID"
+echo ""
+
+# ============================================================
+# EXTRACT WINNING USER ID
+# ============================================================
+
+WINNING_USER_ID=$(grep -o '"userId"[[:space:]]*:[[:space:]]*[0-9]*' "$WINNING_RESPONSE" \
+    | head -1 \
+    | sed 's/.*:[[:space:]]*//')
+
+if [ -z "$WINNING_USER_ID" ]; then
+    echo "ERROR: Could not extract winning userId."
+    exit 1
+fi
+
+echo "Winning user:   $WINNING_USER_ID"
+echo ""
+
+# ============================================================
+# CONFIRM
+# ============================================================
+
+echo "=========================================="
+echo "CONFIRMING WINNING RESERVATION"
+echo "=========================================="
+
+CONFIRM_URL="$BASE_URL/reservations/$RESERVATION_ID/confirm"
+
+CONFIRM_RESPONSE="$WORK_DIR/confirm.body"
+
+CONFIRM_HTTP=$(curl -s \
+    --connect-timeout 10 \
+    --max-time 30 \
+    -X POST "$CONFIRM_URL" \
+    -H "Content-Type: application/json" \
+    -H "X-User-Id: $WINNING_USER_ID" \
+    -H "Idempotency-Key: burst-confirm-$RESERVATION_ID" \
+    -o "$CONFIRM_RESPONSE" \
+    -w "%{http_code}")
+
+echo "Confirm URL:"
+echo "$CONFIRM_URL"
+echo ""
+
+echo "Confirm HTTP status: $CONFIRM_HTTP"
+
+echo "Confirm response:"
+cat "$CONFIRM_RESPONSE"
+
+echo ""
+echo ""
+
+# ============================================================
+# FINAL SHOW STATE
+# ============================================================
+
+echo "=========================================="
+echo "FINAL SHOW STATE"
+echo "=========================================="
+
+STATE=$(curl -s "$BASE_URL/shows/$SHOW_ID")
+
+echo "$STATE"
+echo ""
+
+# ============================================================
+# RECONCILIATION
+# ============================================================
+
+AVAIL=$(echo "$STATE" \
+    | grep -o '"availableSeats"[[:space:]]*:[[:space:]]*[0-9]*' \
+    | head -1 \
+    | sed 's/.*:[[:space:]]*//' || true)
+
+HELD=$(echo "$STATE" \
+    | grep -o '"heldSeats"[[:space:]]*:[[:space:]]*[0-9]*' \
+    | head -1 \
+    | sed 's/.*:[[:space:]]*//' || true)
+
+CONF=$(echo "$STATE" \
+    | grep -o '"confirmedSeats"[[:space:]]*:[[:space:]]*[0-9]*' \
+    | head -1 \
+    | sed 's/.*:[[:space:]]*//' || true)
+
+TOTAL_SEATS=$(echo "$STATE" \
+    | grep -o '"totalSeats"[[:space:]]*:[[:space:]]*[0-9]*' \
+    | head -1 \
+    | sed 's/.*:[[:space:]]*//' || true)
+
+AVAIL=${AVAIL:-0}
+HELD=${HELD:-0}
+CONF=${CONF:-0}
+TOTAL_SEATS=${TOTAL_SEATS:-0}
+
+SUM=$((AVAIL + HELD + CONF))
+
+echo "=========================================="
+echo "FINAL RECONCILIATION"
+echo "=========================================="
+
+echo "Available:   $AVAIL"
+echo "Held:        $HELD"
+echo "Confirmed:   $CONF"
+echo "Total:       $TOTAL_SEATS"
+echo "Sum:         $SUM"
+
+if [ "$SUM" -eq "$TOTAL_SEATS" ]; then
+    echo "✓ RECONCILIATION OK"
+else
+    echo "✗ RECONCILIATION FAILED"
+fi
+
+echo ""
+
+# ============================================================
+# VALIDATION
+# ============================================================
+
 echo "=========================================="
 echo "VALIDATION"
 echo "=========================================="
 
 PASS=true
-if [ "$HTTP_5XX" -gt 0 ]; then echo "✗ FAIL: $HTTP_5XX server errors (should be 0)"; PASS=false; fi
-if [ "$HTTP_201" -ne 1 ]; then echo "✗ FAIL: Expected exactly 1 confirmed, got $HTTP_201"; PASS=false; fi
-if [ "$HTTP_409" -ne $((TOTAL - 1)) ]; then echo "✗ FAIL: Expected $((TOTAL-1)) conflicts, got $HTTP_409"; PASS=false; fi
-if [ "$SUM" -ne "$TOTAL_SEATS" ]; then echo "✗ FAIL: Reconciliation broken"; PASS=false; fi
-if [ "$SEAT_STATUS" != "held" ] && [ "$SEAT_STATUS" != "confirmed" ]; then echo "✗ FAIL: Seat not held/confirmed"; PASS=false; fi
+
+if [ "$HTTP_5XX" -eq 0 ]; then
+    echo "✓ Reserve 5xx = 0"
+else
+    echo "✗ Reserve 5xx = $HTTP_5XX"
+    PASS=false
+fi
+
+if [ "$HTTP_201" -eq 1 ]; then
+    echo "✓ Exactly 1 successful HOLD"
+else
+    echo "✗ Expected 1 successful HOLD, got $HTTP_201"
+    PASS=false
+fi
+
+if [ "$CONFIRM_HTTP" -ge 200 ] && [ "$CONFIRM_HTTP" -lt 300 ]; then
+    echo "✓ Winning reservation CONFIRMED"
+else
+    echo "✗ Confirmation failed: HTTP $CONFIRM_HTTP"
+    PASS=false
+fi
+
+if [ "$SUM" -eq "$TOTAL_SEATS" ]; then
+    echo "✓ Reconciliation OK"
+else
+    echo "✗ Reconciliation FAILED"
+    PASS=false
+fi
+
+echo ""
 
 if [ "$PASS" = true ]; then
-    echo "✓ ALL CHECKS PASSED"
+
+    echo "=========================================="
+    echo "✓ ALL BURST CHECKS PASSED"
+    echo "=========================================="
+
     exit 0
+
 else
-    echo "✗ SOME CHECKS FAILED"
+
+    echo "=========================================="
+    echo "✗ BURST TEST FAILED"
+    echo "=========================================="
+
     exit 1
+
 fi

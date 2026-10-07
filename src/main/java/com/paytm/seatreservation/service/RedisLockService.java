@@ -11,7 +11,8 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.UUID;
-
+import lombok.AllArgsConstructor;
+import lombok.Getter;
 @Service
 public class RedisLockService {
 
@@ -34,11 +35,21 @@ public class RedisLockService {
         this.redisTemplate = redisTemplate;
     }
 
+    @Getter
+    @AllArgsConstructor
+    public static class AcquiredLocks {
+        private final List<String> keys;
+        private final String lockValue;
+    }
     /**
      * Acquires distributed locks for multiple seats in sorted order to prevent deadlocks.
      * Returns list of acquired lock keys. If any lock fails, releases all acquired and returns empty list.
      */
-    public List<String> acquireLocks(Long showId, List<String> seatNumbers, Duration ttl) {
+    public AcquiredLocks acquireLocks(
+            Long showId,
+            List<String> seatNumbers,
+            Duration ttl) {
+
         List<String> sorted = new ArrayList<>(seatNumbers);
         Collections.sort(sorted);
 
@@ -47,13 +58,29 @@ public class RedisLockService {
 
         try {
             for (String seat : sorted) {
+
                 String key = LOCK_PREFIX + showId + ":" + seat;
-                Boolean ok = redisTemplate.opsForValue().setIfAbsent(key, lockValue, ttl);
-                if (Boolean.TRUE.equals(ok)) acquired.add(key);
-                else { releaseLocks(acquired, lockValue); return List.of(); }
+
+                Boolean ok = redisTemplate.opsForValue()
+                        .setIfAbsent(key, lockValue, ttl);
+
+                if (Boolean.TRUE.equals(ok)) {
+                    acquired.add(key);
+                } else {
+                    // Failed to acquire one seat.
+                    // Release everything already acquired.
+                    releaseLocks(acquired, lockValue);
+                    return null;
+                }
             }
-            return acquired;
-        } catch (Exception e) { releaseLocks(acquired, lockValue); throw e; }
+
+            return new AcquiredLocks(acquired, lockValue);
+
+        } catch (Exception e) {
+
+            releaseLocks(acquired, lockValue);
+            throw e;
+        }
     }
 
     public void releaseLocks(List<String> keys, String lockValue) {

@@ -1,9 +1,11 @@
 package com.paytm.seatreservation.entity;
 
 public enum ReservationStatus {
-    PENDING,
+	PENDING,
+    HELD,
     CONFIRMED,
     FAILED,
-    IDEMPOTENT_REPLAY,
-    CANCELLED
+    
+    CANCELLED,
+    EXPIRED
 }

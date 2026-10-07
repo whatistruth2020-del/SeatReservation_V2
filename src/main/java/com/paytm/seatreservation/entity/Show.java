@@ -29,6 +29,7 @@ public class Show {
     private Long pricePaise;
 
     @Column(name = "per_user_limit", nullable = false)
+    @Builder.Default
     private Integer perUserLimit = 4;
 
     @Column(name = "total_seats", nullable = false)

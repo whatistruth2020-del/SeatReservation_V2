@@ -21,10 +21,10 @@ public interface SeatRepository extends JpaRepository<Seat, Long> {
 
     List<Seat> findByShowIdAndStatus(Long showId, SeatStatus status);
 
-    @Query("SELECT COUNT(s) FROM Seat s WHERE s.showId = :showId AND s.status = :status")
+    @Query("SELECT COUNT(s) FROM Seat s WHERE s.show.id = :showId AND s.status = :status")
     long countByShowIdAndStatus(Long showId, SeatStatus status);
 
-    @Query("SELECT s FROM Seat s WHERE s.showId = :showId AND s.seatNumber IN :seatNumbers")
+    @Query("SELECT s FROM Seat s WHERE s.show.id = :showId AND s.seatNumber IN :seatNumbers")
     List<Seat> findByShowIdAndSeatNumbers(Long showId, List<String> seatNumbers);
 
     @Modifying
@@ -65,10 +65,27 @@ public interface SeatRepository extends JpaRepository<Seat, Long> {
             SeatStatus expectedStatus,
             SeatStatus newStatus);
 
+    @Modifying
+    @Query("""
+        UPDATE Seat s
+           SET s.status = :newStatus,
+               s.holdExpiresAt = NULL,
+               s.updatedAt = CURRENT_TIMESTAMP,
+               s.version = s.version + 1
+         WHERE s.id = :seatId
+           AND s.version = :version
+           AND s.status = :oldStatus
+    """)
+    int confirmSeat(
+             Long seatId,
+             Long version,
+             SeatStatus oldStatus,
+            SeatStatus newStatus);
+    
     @Lock(LockModeType.PESSIMISTIC_WRITE)
-    @Query("SELECT s FROM Seat s WHERE s.showId = :showId AND s.seatNumber IN :seatNumbers ORDER BY s.seatNumber")
+    @Query("SELECT s FROM Seat s WHERE s.show.id = :showId AND s.seatNumber IN :seatNumbers ORDER BY s.seatNumber")
     List<Seat> findByShowIdAndSeatNumbersForUpdate(Long showId, List<String> seatNumbers);
 
-    @Query("SELECT s FROM Seat s WHERE s.status = :status AND s.holdExpiresAt IS NOT NULL AND s.holdExpiresAt < :now")
-    List<Seat> findExpiredHolds(OffsetDateTime now);
+    @Query("SELECT s FROM Seat s WHERE s.status = :status AND s.holdExpiresAt IS NOT NULL AND s.holdExpiresAt <= :now")
+    List<Seat> findExpiredHolds(SeatStatus status, OffsetDateTime now);
 }

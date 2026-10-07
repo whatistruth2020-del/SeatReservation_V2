@@ -22,7 +22,7 @@ public class AppProperties {
     @NotNull
     @Min(1)
     @Max(60)
-    private Integer holdTtlMinutes = 5;
+    private Integer holdTtlMinutes = 1;
 
     @NotNull
     @Min(1)
@@ -37,7 +37,7 @@ public class AppProperties {
     @NotNull
     @Min(1)
     @Max(50)
-    private Integer maxSeatsPerRequest = 10;
+    private Integer maxSeatsPerRequest = 4;
 
     public Integer getDefaultPerUserLimit() {
         return defaultPerUserLimit;
